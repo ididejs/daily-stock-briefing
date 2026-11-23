@@ -1,4 +1,5 @@
 import os
+import re
 import smtplib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -6,6 +7,7 @@ from pathlib import Path
 
 import feedparser
 import markdown
+import yfinance as yf
 from google import genai
 from google.genai import types
 
@@ -19,9 +21,52 @@ RSS_FEEDS = {
     "MarketWatch Top Stories": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
 }
 
+MARKET_TICKERS = {
+    "다우존스30": "^DJI",
+    "S&P 500": "^GSPC",
+    "나스닥 종합": "^IXIC",
+    "코스피 (KOSPI)": "^KS11",
+    "코스닥 (KOSDAQ)": "^KQ11",
+    "원/달러 환율": "KRW=X",
+    "미 국채 10년물 금리(%)": "^TNX",
+    "WTI 유가 (달러)": "CL=F",
+    "브렌트유 (달러)": "BZ=F",
+    "국제 금 (달러)": "GC=F",
+    "비트코인 (USD)": "BTC-USD",
+}
 
-def fetch_rss_headlines(limit_per_feed: int = 8) -> str:
-    """Collect recent headlines from major financial news RSS feeds."""
+
+def strip_html(text: str) -> str:
+    """Remove HTML tags and collapse whitespace."""
+    clean = re.sub(r"<[^>]+>", " ", text or "")
+    return re.sub(r"\s+", " ", clean).strip()
+
+
+def fetch_market_snapshot() -> str:
+    """Fetch latest closing price and daily change for key indices and macro indicators."""
+    lines: list[str] = []
+    for name, symbol in MARKET_TICKERS.items():
+        try:
+            hist = yf.Ticker(symbol).history(period="5d")
+            if len(hist) >= 2:
+                prev_close = float(hist["Close"].iloc[-2])
+                last_close = float(hist["Close"].iloc[-1])
+                pct = ((last_close - prev_close) / prev_close) * 100
+                date_str = hist.index[-1].strftime("%Y-%m-%d")
+                lines.append(
+                    f"- {name} ({symbol}): {last_close:,.2f} (전일 대비 {pct:+.2f}%, 기준일 {date_str})"
+                )
+            elif len(hist) == 1:
+                last_close = float(hist["Close"].iloc[-1])
+                date_str = hist.index[-1].strftime("%Y-%m-%d")
+                lines.append(f"- {name} ({symbol}): {last_close:,.2f} (기준일 {date_str})")
+        except Exception as exc:
+            lines.append(f"- {name} ({symbol}): 조회 실패 ({exc})")
+    return "\n".join(lines)
+
+
+def fetch_rss_headlines(limit_per_feed: int = 12) -> str:
+    """Collect recent headlines and summaries from major financial news RSS feeds."""
     sections: list[str] = []
     for source, url in RSS_FEEDS.items():
         try:
@@ -29,9 +74,15 @@ def fetch_rss_headlines(limit_per_feed: int = 8) -> str:
             items = []
             for entry in feed.entries[:limit_per_feed]:
                 title = getattr(entry, "title", "").strip()
+                summary = strip_html(getattr(entry, "summary", ""))[:220]
                 published = getattr(entry, "published", "").strip()
                 if title:
-                    items.append(f"- {title} ({published})" if published else f"- {title}")
+                    line = f"- **{title}**"
+                    if published:
+                        line += f" ({published})"
+                    if summary:
+                        line += f" — {summary}"
+                    items.append(line)
             if items:
                 sections.append(f"### {source}\n" + "\n".join(items))
         except Exception as exc:
@@ -39,17 +90,14 @@ def fetch_rss_headlines(limit_per_feed: int = 8) -> str:
     return "\n\n".join(sections)
 
 
-def build_prompt(today_str: str, rss_context: str) -> str:
+def build_prompt(today_str: str, market_snapshot: str, rss_context: str) -> str:
     """Build the structured prompt for the daily morning stock briefing."""
     return f"""오늘은 {today_str} (KST, 한국 표준시)입니다.
-오전 9시 국내 증시 개장 전 모닝 브리핑을 위해 국내외 증시 주요 뉴스와 지표를 조사하여 마크다운(.md) 문서로 작성해 주세요.
+오전 9시 국내 증시 개장 전 모닝 브리핑을 위해 아래 제공된 [실제 시장 지표 데이터]와 [주요 언론사 RSS 뉴스]를 바탕으로 마크다운(.md) 문서를 작성해 주세요.
 
-[출처 원칙]
-- 주요 경제지·통신사·공식 기관 발표만 참고하세요.
-- 개인 의견이 들어간 유튜브·블로그·SNS 게시물은 절대 참고하지 마세요.
-- 확인되지 않은 수치나 사실은 추측하지 말고, 확인 가능한 최신 수치와 기준 시점을 명확히 적으세요.
-
-[분량 및 스타일]
+[작성 원칙]
+- 제공된 수치와 뉴스 내용에 기반해 정확히 작성하고, 확인되지 않은 수치나 일정은 절대 지어내지 마세요.
+- 개인 의견이 들어간 유튜브·블로그·SNS 내용은 배제하고 주요 경제지·통신사 기사 위주로 정리하세요.
 - 표와 핵심 배경·수치·이슈 설명이 포함된 균형형 브리핑(읽는 시간 3~5분 분량)으로 작성하세요.
 
 [문서 구성]
@@ -64,36 +112,39 @@ def build_prompt(today_str: str, rss_context: str) -> str:
 - 연준(Fed) 금리·통화정책 및 주요 거시경제 지표 발표 요약
 
 ## 2. 글로벌 매크로 지표
-- 미 국채 10년물·2년물 금리, 원/달러 환율, 국제유가(WTI·브렌트유), 국제 금, 비트코인 현황 표 및 변동 배경
+- 미 국채 10년물 금리, 원/달러 환율, 국제유가(WTI·브렌트유), 국제 금, 비트코인 현황 표 및 변동 배경
 
 ## 3. 국내 증시 개장 전 체크포인트
-- 전일 코스피/코스닥 마감 요약, 코스피200 야간선물 및 원/달러 환율 동향
-- 오늘 오전 9시 개장 전 주목할 주요 공시·외국인/기관 수급 포인트·주도 테마
+- 전일 코스피/코스닥 마감 요약 및 원/달러 환율 동향
+- 오늘 오전 9시 개장 전 주목할 주요 기업·수급·정책·테마 뉴스
 - 전 섹터 균형 주요 동향 (반도체, 2차전지, 바이오, 금융, 방산·조선 등)
 
-## 4. 이번 주 / 오늘의 주요 일정 (KST 기준)
-- 당일 및 이번 주 국내외 경제지표 발표, 기업 실적, 주요 증시 이벤트
+## 4. 이번 주 / 오늘의 주요 일정 및 체크포인트
+- 뉴스에서 언급된 주요 경제지표 발표, 통화정책 회의, 실적·증시 이벤트
 
 ## 5. 참고 출처
-- 참고한 주요 언론사 및 공식 기관명 목록
+- Yahoo Finance 시장 데이터 및 참고한 주요 언론사 목록
 
 ---
-참고용 최신 RSS 헤드라인:
+[실제 시장 지표 데이터]
+{market_snapshot}
+
+---
+[주요 언론사 최신 RSS 뉴스]
 {rss_context}
 """
 
 
-def generate_briefing(today_str: str, rss_context: str) -> str:
-    """Generate the markdown briefing using Gemini API with Google Search grounding."""
+def generate_briefing(today_str: str, market_snapshot: str, rss_context: str) -> str:
+    """Generate the markdown briefing using Gemini 4 Hydrogen."""
     api_key = os.environ["GEMINI_API_KEY"]
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
 
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model_name,
-        contents=build_prompt(today_str, rss_context),
+        contents=build_prompt(today_str, market_snapshot, rss_context),
         config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
             temperature=0.3,
         ),
     )
@@ -162,8 +213,9 @@ def main() -> None:
     now_kst = datetime.now(KST)
     today_str = now_kst.strftime("%Y-%m-%d")
 
+    market_snapshot = fetch_market_snapshot()
     rss_context = fetch_rss_headlines()
-    briefing_md = generate_briefing(today_str, rss_context)
+    briefing_md = generate_briefing(today_str, market_snapshot, rss_context)
     report_path = save_report(today_str, briefing_md)
     send_email(today_str, briefing_md, report_path)
     print(f"Successfully generated and emailed {report_path}")
